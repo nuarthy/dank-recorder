@@ -115,6 +115,7 @@ PluginComponent {
     property var _target: ({})
     property var _candidates: []
     property int _candidateIndex: 0
+    property int _requestId: 0
     property string _pendingFile: ""
     property int _pid: 0
     property bool _stopping: false
@@ -252,11 +253,25 @@ PluginComponent {
     }
 
     // ── Capture target resolution ──────────────────────────────────────────
+    function _nextRequest() {
+        _requestId += 1;
+        return _requestId;
+    }
+
+    function _isCurrentRequest(requestId) {
+        return requestId === _requestId;
+    }
+
     function _launch(source, region) {
+        const requestId = _nextRequest();
         _target = {"source": source, "region": region || ""};
         const file = outputDir + "/" + _timestamp() + "." + container;
+        stateVar.set("resolving");
         Proc.runCommand("dankRecorder.mkdir", ["mkdir", "-p", outputDir], (output, exitCode) => {
+            if (!_isCurrentRequest(requestId) || state !== "resolving")
+                return;
             if (exitCode !== 0) {
+                stateVar.set("idle");
                 _notifyError("Cannot create the recording folder", outputDir);
                 return;
             }
@@ -278,9 +293,11 @@ PluginComponent {
         }
         errorVar.set("");
         const mode = modeOverride || captureTarget;
+        const requestId = _nextRequest();
+        stateVar.set("resolving");
 
         if (mode === "region") {
-            _selectRegion();
+            _selectRegion(requestId);
             return "selecting";
         }
         if (mode === "portal")
@@ -289,18 +306,22 @@ PluginComponent {
             return _arm("screen", "");
         if (mode === "monitor" && monitorName)
             return _arm(monitorName, "");
-        _resolveFocusedOutput();
+        _resolveFocusedOutput(requestId);
         return "started";
     }
 
-    function _selectRegion(commandId) {
+    function _selectRegion(requestId, commandId) {
         // gpu-screen-recorder -region wants WxH+X+Y, which is slurp's -f format.
         // slurp reads stdin, and the shell keeps the child's stdin pipe open, so
         // point stdin at /dev/null or slurp blocks before it draws its overlay.
         Proc.runCommand(commandId || "dankRecorder.slurp",
                         ["sh", "-c", "exec slurp -f '%wx%h+%x+%y' </dev/null"], (output, exitCode) => {
+            if (!_isCurrentRequest(requestId))
+                return;
             const region = (output || "").trim();
             if (exitCode !== 0 || !region) {
+                if (state === "resolving")
+                    stateVar.set("idle");
                 root._notifyInfo("Region selection cancelled");
                 return;
             }
@@ -328,7 +349,6 @@ PluginComponent {
             return "not_armed";
         const source = _armedSource;
         const region = _armedRegion;
-        stateVar.set("idle");
         canvasVar.set("");
         _launch(source, region);
         return "started";
@@ -337,6 +357,7 @@ PluginComponent {
     function cancelArmed() {
         if (state !== "armed")
             return "not_armed";
+        _nextRequest();
         stateVar.set("idle");
         canvasVar.set("");
         _notifyInfo("Recording cancelled");
@@ -346,13 +367,14 @@ PluginComponent {
     function reselectRegion() {
         if (state !== "armed")
             return "not_armed";
-        _selectRegion("dankRecorder.slurpReselect");
+        _selectRegion(_nextRequest(), "dankRecorder.slurpReselect");
         return "selecting";
     }
 
     function useFullScreen() {
         if (state !== "armed")
             return "not_armed";
+        _nextRequest();
         return _arm("screen", "");
     }
 
@@ -391,8 +413,10 @@ PluginComponent {
 
     // Prefer the compositor's focused output; fall back to the first monitor
     // gpu-screen-recorder reports, then to its generic "screen" source.
-    function _resolveFocusedOutput() {
+    function _resolveFocusedOutput(requestId) {
         Proc.runCommand("dankRecorder.focused", ["niri", "msg", "--json", "focused-output"], (output, exitCode) => {
+            if (!_isCurrentRequest(requestId) || state !== "resolving")
+                return;
             let name = "";
             if (exitCode === 0) {
                 try {
@@ -406,6 +430,8 @@ PluginComponent {
                 return;
             }
             Proc.runCommand("dankRecorder.monitors", ["gpu-screen-recorder", "--list-monitors"], (listOutput, listCode) => {
+                if (!_isCurrentRequest(requestId) || state !== "resolving")
+                    return;
                 const first = ((listOutput || "").trim().split("\n")[0] || "").split("|")[0].trim();
                 root._arm(first || "screen", "");
             }, 0, 5000);
@@ -542,6 +568,12 @@ PluginComponent {
             return cancelArmed();
         if (state === "idle")
             return "not_recording";
+        if (state === "resolving") {
+            _nextRequest();
+            stateVar.set("idle");
+            _notifyInfo("Recording cancelled");
+            return "cancelled";
+        }
         if (state === "stopping")
             return "stopping";
         _stopping = true;
@@ -688,6 +720,7 @@ PluginComponent {
         target: "dankRecorder"
 
         function start(): string { return root.begin(""); }
+        function startFullscreen(): string { return root.begin("primary"); }
         function startRegion(): string { return root.begin("region"); }
         function startPortal(): string { return root.begin("portal"); }
         function stop(): string { return root.stop(); }
